@@ -2,6 +2,18 @@
 
 export type TransactionType = 'income' | 'expense';
 
+export interface ReceiptOCRData {
+  merchantName: string | null;
+  total: number | null;
+  subtotal: number | null;
+  tax: number | null;
+  extractedDate: string | null;
+  suggestedCategory: string | null;
+  confidence: number;
+  rawText: string;
+  processedAt: string; // ISO date when OCR was performed
+}
+
 export interface Transaction {
   id: string;
   date: string;
@@ -10,6 +22,10 @@ export interface Transaction {
   amount: number;
   notes?: string;
   type: TransactionType;
+  // Receipt attachment
+  receiptImage?: string; // Base64 data URL
+  // OCR extracted data (if receipt was scanned)
+  receiptOCR?: ReceiptOCRData;
 }
 
 export type InvoiceStatus = 'unpaid' | 'paid' | 'void';

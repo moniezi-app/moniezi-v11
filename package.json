@@ -1,7 +1,7 @@
 {
-  "name": "moniezi-v10",
+  "name": "moniezi-v11",
   "private": true,
-  "version": "10.0.0",
+  "version": "11.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,7 +12,8 @@
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "lucide-react": "^0.462.0",
-    "html2pdf.js": "^0.10.1"
+    "html2pdf.js": "^0.10.1",
+    "tesseract.js": "^5.1.1"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

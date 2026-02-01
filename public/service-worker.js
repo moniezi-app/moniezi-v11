@@ -1,10 +1,11 @@
 /* Moniezi PWA Service Worker
    - Fully bundled app - no CDN dependencies
    - Caches all assets for true offline support on all devices
+   - V11: Added Tesseract.js OCR engine for offline receipt scanning
 */
 
 // Bump this on every deploy
-const CACHE_VERSION = "moniezi-pwa-v10-bundled-2026-01-28";
+const CACHE_VERSION = "moniezi-pwa-v11-ocr-2026-01-29";
 const CACHE_NAME = `moniezi-cache-${CACHE_VERSION}`;
 
 // Resolve an asset relative to the service worker scope

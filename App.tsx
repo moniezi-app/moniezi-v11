@@ -79,12 +79,16 @@ import {
   ToggleLeft,
   ToggleRight,
   Copy,
-  ClipboardList
+  ClipboardList,
+  ScanLine,
+  FileCheck,
+  Wand2
 } from 'lucide-react';
-import { Page, Transaction, Invoice, Estimate, Client, ClientStatus, UserSettings, Notification, FilterPeriod, RecurrenceFrequency, FilingStatus, TaxPayment, TaxEstimationMethod, InvoiceItem, EstimateItem, CustomCategories, Receipt as ReceiptType } from './types';
+import { Page, Transaction, Invoice, Estimate, Client, ClientStatus, UserSettings, Notification, FilterPeriod, RecurrenceFrequency, FilingStatus, TaxPayment, TaxEstimationMethod, InvoiceItem, EstimateItem, CustomCategories, Receipt as ReceiptType, ReceiptOCRData } from './types';
 import { CATS_IN, CATS_OUT, CATS_BILLING, DEFAULT_PAY_PREFS, DB_KEY, TAX_CONSTANTS, TAX_PLANNER_2026, getFreshDemoData } from './constants';
 import InsightsDashboard from './InsightsDashboard';
 import { getInsightCount } from './services/insightsEngine';
+import { processReceiptImage, learnFromUserCorrection, preprocessReceiptImage, ExtractedReceiptData } from './services/offlineOCR';
 // --- Utility: UUID Generator ---
 const generateId = (prefix: string) => {
   if (typeof crypto !== 'undefined' && crypto.randomUUID) {
@@ -791,6 +795,23 @@ export default function App() {
   const [scanPreview, setScanPreview] = useState<string | null>(null);
   const [viewingReceipt, setViewingReceipt] = useState<ReceiptType | null>(null);
   const scanInputRef = useRef<HTMLInputElement>(null);
+
+  // OCR Scanning State
+  const [isOCRProcessing, setIsOCRProcessing] = useState(false);
+  const [ocrProgress, setOCRProgress] = useState<{ percent: number; status: string }>({ percent: 0, status: '' });
+  const [ocrResult, setOCRResult] = useState<{
+    merchantName: string | null;
+    total: number | null;
+    subtotal: number | null;
+    tax: number | null;
+    date: string | null;
+    suggestedCategory: string | null;
+    categoryConfidence: 'high' | 'medium' | 'low';
+    rawText: string;
+    confidence: number;
+  } | null>(null);
+  const [showOCRReviewModal, setShowOCRReviewModal] = useState(false);
+  const [pendingOCRImage, setPendingOCRImage] = useState<string | null>(null);
 
   // Tax Planner State
   const [isPlannerOpen, setIsPlannerOpen] = useState(false);
@@ -4207,8 +4228,115 @@ TIMELINE: Assumes 48-72hr feedback turnaround.`,
       }
   };
 
-  // --- Scan Receipt Functions ---
-  const handleScanReceipt = (event: React.ChangeEvent<HTMLInputElement>) => {
+  // --- Scan Receipt Functions (with OCR) ---
+  const handleScanReceipt = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    
+    try {
+      // First compress the image
+      const compressedImage = await compressReceiptImage(file);
+      setPendingOCRImage(compressedImage);
+      
+      // Start OCR processing
+      setIsOCRProcessing(true);
+      setOCRProgress({ percent: 0, status: 'Preparing image...' });
+      setShowOCRReviewModal(true);
+      
+      // Preprocess for better OCR results
+      const preprocessed = await preprocessReceiptImage(compressedImage);
+      
+      // Run OCR
+      const result = await processReceiptImage(preprocessed, (percent, status) => {
+        setOCRProgress({ percent, status });
+      });
+      
+      // Store OCR results for review
+      setOCRResult({
+        merchantName: result.merchantName,
+        total: result.total,
+        subtotal: result.subtotal,
+        tax: result.tax,
+        date: result.date,
+        suggestedCategory: result.suggestedCategory,
+        categoryConfidence: result.categoryConfidence,
+        rawText: result.rawText,
+        confidence: result.confidence
+      });
+      
+      setIsOCRProcessing(false);
+      
+    } catch (err) {
+      console.error("OCR error:", err);
+      setIsOCRProcessing(false);
+      setOCRResult(null);
+      showToast("Failed to scan receipt. Try again.", "error");
+    }
+    
+    // Reset input so same file can be selected again
+    event.target.value = '';
+  };
+
+  // Create transaction from OCR scan
+  const createTransactionFromOCR = (userOverrides?: {
+    name?: string;
+    amount?: number;
+    date?: string;
+    category?: string;
+  }) => {
+    if (!ocrResult || !pendingOCRImage) return;
+    
+    const name = userOverrides?.name || ocrResult.merchantName || 'Unknown Merchant';
+    const amount = userOverrides?.amount ?? ocrResult.total ?? 0;
+    const date = userOverrides?.date || ocrResult.date || new Date().toISOString().split('T')[0];
+    const category = userOverrides?.category || ocrResult.suggestedCategory || CATS_OUT[0];
+    
+    // Learn from user corrections for future accuracy
+    learnFromUserCorrection(ocrResult.merchantName, name, category);
+    
+    // Create the transaction with receipt attached
+    const newTx: Transaction = {
+      id: generateId('tx'),
+      type: 'expense',
+      name,
+      amount,
+      date,
+      category,
+      notes: `Scanned from receipt (${Math.round(ocrResult.confidence)}% confidence)`,
+      receiptImage: pendingOCRImage,
+      receiptOCR: {
+        merchantName: ocrResult.merchantName,
+        total: ocrResult.total,
+        subtotal: ocrResult.subtotal,
+        tax: ocrResult.tax,
+        extractedDate: ocrResult.date,
+        suggestedCategory: ocrResult.suggestedCategory,
+        confidence: ocrResult.confidence,
+        rawText: ocrResult.rawText,
+        processedAt: new Date().toISOString()
+      }
+    };
+    
+    setTransactions(prev => [newTx, ...prev]);
+    
+    // Cleanup
+    setShowOCRReviewModal(false);
+    setOCRResult(null);
+    setPendingOCRImage(null);
+    
+    showToast(`Expense "${name}" created from receipt!`, 'success');
+  };
+
+  // Cancel OCR scan
+  const cancelOCRScan = () => {
+    setShowOCRReviewModal(false);
+    setIsOCRProcessing(false);
+    setOCRResult(null);
+    setPendingOCRImage(null);
+  };
+
+  // Legacy save receipt (just saves image without OCR)
+  const handleScanReceiptLegacy = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
         compressReceiptImage(file).then(base64 => {
@@ -4217,7 +4345,6 @@ TIMELINE: Assumes 48-72hr feedback turnaround.`,
             console.error("Compression error:", err);
             showToast("Failed to process image", "error");
         });
-        // Reset input so same file can be selected again if needed
         event.target.value = '';
     }
   };
@@ -4250,8 +4377,8 @@ TIMELINE: Assumes 48-72hr feedback turnaround.`,
   const handleExportBackup = () => {
     const backup = {
         metadata: {
-            appName: "Moniezi Pro v7",
-            version: "7.0.0",
+            appName: "Moniezi Pro v11",
+            version: "11.0.0",
             timestamp: new Date().toISOString(),
         },
         data: {
@@ -4271,7 +4398,7 @@ TIMELINE: Assumes 48-72hr feedback turnaround.`,
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = `moniezi_v7_backup_${new Date().toISOString().split('T')[0]}.json`;
+    link.download = `moniezi_v11_backup_${new Date().toISOString().split('T')[0]}.json`;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -4622,6 +4749,222 @@ html:not(.dark) .divide-slate-200 > :not([hidden]) ~ :not([hidden]) { border-col
                     <button onClick={saveReceipt} className="flex-1 py-3 font-bold text-white bg-blue-600 hover:bg-blue-700 rounded-lg shadow-lg shadow-blue-500/20 transition-colors">Save</button>
                 </div>
             </div>
+        </div>
+      )}
+
+      {/* OCR Receipt Review Modal - Smart Receipt Scanner */}
+      {showOCRReviewModal && (
+        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/95 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+          <div className="bg-white dark:bg-slate-900 w-full max-w-md rounded-2xl shadow-2xl border border-slate-200 dark:border-slate-800 flex flex-col max-h-[95vh] overflow-hidden">
+            {/* Header */}
+            <div className="flex items-center justify-between p-4 border-b border-slate-200 dark:border-slate-800 bg-gradient-to-r from-blue-600 to-indigo-600">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-white/20 rounded-full flex items-center justify-center">
+                  <ScanLine size={20} className="text-white" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-white">Smart Receipt Scanner</h3>
+                  <p className="text-xs text-blue-100">Offline OCR • No cloud required</p>
+                </div>
+              </div>
+              <button 
+                onClick={cancelOCRScan} 
+                className="p-2 bg-white/10 hover:bg-white/20 rounded-full transition-colors"
+              >
+                <X size={18} className="text-white" />
+              </button>
+            </div>
+
+            {/* Content */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-4">
+              {/* Image Preview */}
+              {pendingOCRImage && (
+                <div className="relative rounded-xl overflow-hidden bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+                  <img 
+                    src={pendingOCRImage} 
+                    alt="Receipt" 
+                    className="w-full max-h-48 object-contain"
+                  />
+                  {isOCRProcessing && (
+                    <div className="absolute inset-0 bg-slate-950/70 flex flex-col items-center justify-center">
+                      <Loader2 size={32} className="text-blue-400 animate-spin mb-3" />
+                      <div className="text-white text-sm font-medium mb-2">{ocrProgress.status}</div>
+                      <div className="w-48 h-2 bg-slate-700 rounded-full overflow-hidden">
+                        <div 
+                          className="h-full bg-gradient-to-r from-blue-500 to-indigo-500 transition-all duration-300"
+                          style={{ width: `${ocrProgress.percent}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* OCR Results */}
+              {!isOCRProcessing && ocrResult && (
+                <>
+                  {/* Confidence Badge */}
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <FileCheck size={16} className={ocrResult.confidence > 70 ? 'text-emerald-500' : ocrResult.confidence > 50 ? 'text-amber-500' : 'text-red-500'} />
+                      <span className="text-xs font-medium text-slate-600 dark:text-slate-400">
+                        {ocrResult.confidence > 70 ? 'High' : ocrResult.confidence > 50 ? 'Medium' : 'Low'} confidence ({Math.round(ocrResult.confidence)}%)
+                      </span>
+                    </div>
+                    {ocrResult.categoryConfidence === 'high' && (
+                      <span className="px-2 py-1 bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-400 text-xs font-bold rounded-full flex items-center gap-1">
+                        <Wand2 size={12} /> Auto-categorized
+                      </span>
+                    )}
+                  </div>
+
+                  {/* Extracted Fields Form */}
+                  <div className="space-y-3 bg-slate-50 dark:bg-slate-800/50 p-4 rounded-xl border border-slate-200 dark:border-slate-700">
+                    {/* Merchant Name */}
+                    <div>
+                      <label className="text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1 block">
+                        Merchant / Vendor
+                      </label>
+                      <input
+                        type="text"
+                        value={ocrResult.merchantName || ''}
+                        onChange={e => setOCRResult(prev => prev ? { ...prev, merchantName: e.target.value } : prev)}
+                        className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2.5 text-sm font-medium outline-none focus:ring-2 focus:ring-blue-500/30"
+                        placeholder="Enter merchant name"
+                      />
+                    </div>
+
+                    {/* Amount & Date Row */}
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1 block">
+                          Total Amount
+                        </label>
+                        <div className="relative">
+                          <span className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 font-bold">{settings.currencySymbol}</span>
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={ocrResult.total ?? ''}
+                            onChange={e => setOCRResult(prev => prev ? { ...prev, total: parseFloat(e.target.value) || null } : prev)}
+                            className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg pl-8 pr-3 py-2.5 text-sm font-bold outline-none focus:ring-2 focus:ring-blue-500/30"
+                            placeholder="0.00"
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <label className="text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-1 block">
+                          Date
+                        </label>
+                        <input
+                          type="date"
+                          value={ocrResult.date || new Date().toISOString().split('T')[0]}
+                          onChange={e => setOCRResult(prev => prev ? { ...prev, date: e.target.value } : prev)}
+                          className="w-full bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 rounded-lg px-3 py-2.5 text-sm font-medium outline-none focus:ring-2 focus:ring-blue-500/30"
+                        />
+                      </div>
+                    </div>
+
+                    {/* Tax/Subtotal (collapsed by default) */}
+                    {(ocrResult.subtotal || ocrResult.tax) && (
+                      <div className="grid grid-cols-2 gap-3 pt-2 border-t border-slate-200 dark:border-slate-700">
+                        {ocrResult.subtotal && (
+                          <div className="text-xs text-slate-500 dark:text-slate-400">
+                            <span className="font-medium">Subtotal:</span> {settings.currencySymbol}{ocrResult.subtotal.toFixed(2)}
+                          </div>
+                        )}
+                        {ocrResult.tax && (
+                          <div className="text-xs text-slate-500 dark:text-slate-400">
+                            <span className="font-medium">Tax:</span> {settings.currencySymbol}{ocrResult.tax.toFixed(2)}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Category Selection */}
+                    <div className="pt-2">
+                      <label className="text-xs font-bold text-slate-600 dark:text-slate-400 uppercase tracking-wider mb-2 block">
+                        Category {ocrResult.categoryConfidence === 'high' && <span className="text-emerald-500 normal-case">(suggested)</span>}
+                      </label>
+                      <div className="flex flex-wrap gap-2 max-h-32 overflow-y-auto">
+                        {CATS_OUT.map(cat => (
+                          <button
+                            key={cat}
+                            type="button"
+                            onClick={() => setOCRResult(prev => prev ? { ...prev, suggestedCategory: cat } : prev)}
+                            className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all ${
+                              ocrResult.suggestedCategory === cat
+                                ? 'bg-blue-600 text-white shadow-lg'
+                                : 'bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-400 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-800'
+                            }`}
+                          >
+                            {cat}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Raw Text Preview (Collapsible) */}
+                  <details className="group">
+                    <summary className="text-xs font-medium text-slate-500 dark:text-slate-400 cursor-pointer hover:text-slate-700 dark:hover:text-slate-300 flex items-center gap-2">
+                      <ChevronRight size={14} className="transition-transform group-open:rotate-90" />
+                      View extracted text
+                    </summary>
+                    <div className="mt-2 p-3 bg-slate-100 dark:bg-slate-800 rounded-lg text-xs font-mono text-slate-600 dark:text-slate-400 max-h-32 overflow-y-auto whitespace-pre-wrap">
+                      {ocrResult.rawText || 'No text extracted'}
+                    </div>
+                  </details>
+                </>
+              )}
+
+              {/* Loading State */}
+              {isOCRProcessing && !pendingOCRImage && (
+                <div className="flex flex-col items-center justify-center py-12">
+                  <Loader2 size={40} className="text-blue-500 animate-spin mb-4" />
+                  <p className="text-slate-600 dark:text-slate-400 font-medium">{ocrProgress.status}</p>
+                </div>
+              )}
+            </div>
+
+            {/* Footer Actions */}
+            <div className="p-4 border-t border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-800/50">
+              {!isOCRProcessing && ocrResult ? (
+                <div className="flex gap-3">
+                  <button
+                    onClick={cancelOCRScan}
+                    className="flex-1 py-3 font-bold text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-xl transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={() => createTransactionFromOCR({
+                      name: ocrResult.merchantName || undefined,
+                      amount: ocrResult.total ?? undefined,
+                      date: ocrResult.date || undefined,
+                      category: ocrResult.suggestedCategory || undefined
+                    })}
+                    className="flex-1 py-3 font-bold text-white bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 rounded-xl shadow-lg shadow-blue-500/20 transition-all flex items-center justify-center gap-2"
+                  >
+                    <Plus size={18} /> Create Expense
+                  </button>
+                </div>
+              ) : (
+                <button
+                  onClick={cancelOCRScan}
+                  className="w-full py-3 font-bold text-slate-600 dark:text-slate-300 bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 hover:bg-slate-100 dark:hover:bg-slate-700 rounded-xl transition-colors"
+                >
+                  Cancel
+                </button>
+              )}
+              
+              {/* Privacy Notice */}
+              <div className="mt-3 flex items-center justify-center gap-2 text-xs text-slate-500 dark:text-slate-500">
+                <Shield size={12} />
+                <span>100% offline • Your data never leaves your device</span>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
@@ -5345,17 +5688,24 @@ html:not(.dark) .divide-slate-200 > :not([hidden]) ~ :not([hidden]) { border-col
                </div>
             </div>
 
-            {/* Scan Receipt Section */}
+            {/* Smart Receipt Scanner Section */}
             <div>
               <div className="flex items-center justify-between mb-4 pl-2">
-                <h3 className="text-base sm:text-lg font-extrabold text-slate-900 dark:text-slate-200 uppercase tracking-[0.10em] font-brand">Receipts</h3>
+                <div className="flex items-center gap-2">
+                  <h3 className="text-base sm:text-lg font-extrabold text-slate-900 dark:text-slate-200 uppercase tracking-[0.10em] font-brand">Receipts</h3>
+                  <span className="px-2 py-0.5 bg-gradient-to-r from-blue-600 to-indigo-600 text-white text-[9px] font-bold uppercase tracking-wider rounded-full">OCR</span>
+                </div>
               </div>
               <div className="flex overflow-x-auto gap-3 pb-4 pt-1 px-1 -mx-1 custom-scrollbar snap-x">
-                <button onClick={() => scanInputRef.current?.click()} className="flex-shrink-0 w-24 h-24 bg-slate-200 dark:bg-slate-800 rounded-xl flex flex-col items-center justify-center gap-2 hover:bg-slate-300 dark:hover:bg-slate-700 transition-colors border border-dashed border-slate-400 dark:border-slate-600 active:scale-95 snap-start">
-                   <div className="bg-white dark:bg-slate-900 p-2.5 rounded-full shadow-sm text-slate-900 dark:text-white">
-                     <Camera size={20} />
+                {/* Smart Scan Button with OCR */}
+                <button onClick={() => scanInputRef.current?.click()} className="flex-shrink-0 w-28 h-28 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-xl flex flex-col items-center justify-center gap-2 hover:from-blue-600 hover:to-indigo-700 transition-all border border-blue-400/30 active:scale-95 snap-start shadow-lg shadow-blue-500/20 group">
+                   <div className="bg-white/20 p-3 rounded-full group-hover:scale-110 transition-transform">
+                     <ScanLine size={24} className="text-white" />
                    </div>
-                   <span className="text-[10px] font-bold uppercase tracking-wider text-slate-600 dark:text-slate-300">Scan</span>
+                   <div className="text-center">
+                     <span className="text-xs font-bold text-white block">Smart Scan</span>
+                     <span className="text-[9px] text-blue-100 opacity-80">Auto-extract</span>
+                   </div>
                 </button>
                 <input type="file" ref={scanInputRef} className="hidden" accept="image/*" capture="environment" onChange={handleScanReceipt} />
                 
@@ -5368,7 +5718,10 @@ html:not(.dark) .divide-slate-200 > :not([hidden]) ~ :not([hidden]) { border-col
                    </div>
                 ))}
               </div>
-              <div className="text-[10px] text-slate-400 font-medium text-center mt-2 uppercase tracking-wide">Exports to Downloads</div>
+              <div className="text-[10px] text-slate-500 dark:text-slate-400 font-medium text-center mt-2 flex items-center justify-center gap-2">
+                <Shield size={10} />
+                <span>100% Offline OCR • No cloud required</span>
+              </div>
             </div>
           </div>
         )}
